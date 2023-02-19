@@ -786,10 +786,10 @@ func (s *PublicBlockChainAPI) GetHeaderByHash(ctx context.Context, hash common.H
 }
 
 // GetBlockByNumber returns the requested canonical block.
-// * When blockNr is -1 the chain head is returned.
-// * When blockNr is -2 the pending chain head is returned.
-// * When fullTx is true all transactions in the block are returned, otherwise
-//   only the transaction hash is returned.
+//   - When blockNr is -1 the chain head is returned.
+//   - When blockNr is -2 the pending chain head is returned.
+//   - When fullTx is true all transactions in the block are returned, otherwise
+//     only the transaction hash is returned.
 func (s *PublicBlockChainAPI) GetBlockByNumber(ctx context.Context, number rpc.BlockNumber, fullTx bool) (map[string]interface{}, error) {
 	block, err := s.b.BlockByNumber(ctx, number)
 	if block != nil && err == nil {
@@ -1047,6 +1047,57 @@ func newRevertError(result *core.ExecutionResult) *revertError {
 	}
 }
 
+func DoUnlimitedCall(ctx context.Context, state *state.StateDB, header *types.Header, b Backend, args TransactionArgs, blockNrOrHash rpc.BlockNumberOrHash, overrides *StateOverride, timeout time.Duration, globalGasCap uint64) (*core.ExecutionResult, error) {
+	defer func(start time.Time) { log.Debug("Executing EVM call finished", "runtime", time.Since(start)) }(time.Now())
+
+	if err := overrides.Apply(state); err != nil {
+		return nil, err
+	}
+	// Setup context so it may be cancelled the call has completed
+	// or, in case of unmetered gas, setup a context with a timeout.
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	// Make sure the context is cancelled when the call has completed
+	// this makes sure resources are cleaned up.
+	defer cancel()
+
+	// Get a new instance of the EVM.
+	msg, err := args.ToMessage(globalGasCap, header.BaseFee)
+	if err != nil {
+		return nil, err
+	}
+	evm, vmError, err := b.GetEVM(ctx, msg, state, header, &vm.Config{NoBaseFee: true})
+	if err != nil {
+		return nil, err
+	}
+	// Wait for the context to be done and cancel the evm. Even if the
+	// EVM has finished, cancelling may be done (repeatedly)
+	go func() {
+		<-ctx.Done()
+		evm.Cancel()
+	}()
+
+	// Execute the message.
+	gp := new(core.GasPool).AddGas(math.MaxUint64)
+	result, err := core.ApplyMessage(evm, msg, gp)
+	if err := vmError(); err != nil {
+		return nil, err
+	}
+
+	// If the timer caused an abort, return an appropriate error message
+	if evm.Cancelled() {
+		return nil, fmt.Errorf("execution aborted (timeout = %v)", timeout)
+	}
+	if err != nil {
+		return result, fmt.Errorf("err: %w (supplied gas %d)", err, msg.Gas())
+	}
+	return result, nil
+}
+
 // revertError is an API error that encompassas an EVM revertal with JSON error
 // code and a binary data blob.
 type revertError struct {
@@ -1081,6 +1132,60 @@ func (s *PublicBlockChainAPI) Call(ctx context.Context, args TransactionArgs, bl
 		return nil, newRevertError(result)
 	}
 	return result.Return(), result.Err
+}
+
+type Result struct {
+	Results []hexutil.Bytes `json:"results"`
+	Errors  []string        `json:"errors"`
+}
+
+// UnlimitedCall 为合约执行交易，不限制gas，但是有超时时间设置,支持批量
+func (s *PublicBlockChainAPI) UnlimitedCall(ctx context.Context, args []TransactionArgs, blockNrOrHash rpc.BlockNumberOrHash, timeOut hexutil.Big, overrides *StateOverride) (*Result, error) {
+	var timeOutDuration time.Duration
+	if timeOut.ToInt().Int64() == 0 {
+		// 默认一般是5s
+		timeOutDuration = s.b.RPCEVMTimeout()
+	} else {
+		timeOutDuration = time.Duration(timeOut.ToInt().Int64()) * time.Second
+	}
+
+	state, header, err := s.b.StateAndHeaderByNumberOrHash(ctx, blockNrOrHash)
+	if state == nil || err != nil {
+		return nil, err
+	}
+
+	results := make([]hexutil.Bytes, len(args))
+	errors := make([]string, len(args))
+	for i, arg := range args {
+		//不要gas限制
+		arg.Gas = nil
+		// gas = uint64(math.MaxUint64 / 2)
+		globalGasCap := uint64(0)
+		result, err := DoUnlimitedCall(ctx, state, header, s.b, arg, blockNrOrHash, overrides, timeOutDuration, globalGasCap)
+		if err != nil {
+			results[i] = nil
+			errors[i] = err.Error()
+			continue
+		}
+
+		// If the result contains a revert reason, try to unpack and return it.
+		if len(result.Revert()) > 0 {
+			results[i] = nil
+			errors[i] = newRevertError(result).Error()
+			continue
+		}
+		results[i] = result.Return()
+		if result.Err != nil {
+			errors[i] = result.Err.Error()
+		} else {
+			errors[i] = ""
+		}
+	}
+
+	return &Result{
+		Results: results,
+		Errors:  errors,
+	}, nil
 }
 
 func DoEstimateGas(ctx context.Context, b Backend, args TransactionArgs, blockNrOrHash rpc.BlockNumberOrHash, gasCap uint64) (g hexutil.Uint64, e error) {
@@ -1877,7 +1982,8 @@ func (s *PublicTransactionPoolAPI) SendRawTransaction(ctx context.Context, input
 	return SubmitTransaction(ctx, s.b, tx)
 }
 
-/**
+/*
+*
 check tx meta transaction format.
 */
 func metaTransactionCheck(ctx context.Context, tx *types.Transaction, b Backend) error {
@@ -2181,13 +2287,13 @@ func (api *PrivateDebugAPI) ChaindbCompact() error {
 	return nil
 }
 
-//TODO warning delete this when online
+// TODO warning delete this when online
 func (api *PrivateDebugAPI) GetPoolNonce(ctx context.Context, address string) (*hexutil.Uint64, error) {
 	nonce, err := api.b.GetPoolNonce(ctx, common.HexToAddress(address))
 	return (*hexutil.Uint64)(&nonce), err
 }
 
-//TODO warning delete this when online
+// TODO warning delete this when online
 func (api *PrivateDebugAPI) SendTransactions(ctx context.Context, signedTxs []*types.Transaction) ([]string, error) {
 	var txsHash = make([]string, len(signedTxs))
 	if len(signedTxs) == 0 {
